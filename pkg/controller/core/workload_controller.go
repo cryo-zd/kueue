@@ -1808,12 +1808,11 @@ func (h *deviceClassHandler) Create(ctx context.Context, e event.CreateEvent, q 
 func (h *deviceClassHandler) Update(ctx context.Context, e event.UpdateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 	oldDC := e.ObjectOld.(*resourcev1.DeviceClass)
 	newDC := e.ObjectNew.(*resourcev1.DeviceClass)
-	if oldERN := extendedResourceName(oldDC); oldERN != "" {
-		h.r.draBackedResources.Remove(corev1.ResourceName(oldERN), oldDC.Name)
-	}
-	if newERN := extendedResourceName(newDC); newERN != "" {
-		h.r.draBackedResources.Add(corev1.ResourceName(newERN), newDC.Name)
-	}
+	h.r.draBackedResources.Update(
+		corev1.ResourceName(extendedResourceName(oldDC)),
+		corev1.ResourceName(extendedResourceName(newDC)),
+		newDC.Name,
+	)
 	h.reconcileWorkloads(ctx, q, extendedResourceName(oldDC), extendedResourceName(newDC))
 }
 

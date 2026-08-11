@@ -75,6 +75,25 @@ func TestExtendedResourceCache(t *testing.T) {
 		}
 	})
 
+	t.Run("update preserves a DeviceClass with the same resource name", func(t *testing.T) {
+		const resourceName = "example.com/gpu"
+		cache.Add(resourceName, "gpu.example.com")
+		cache.Update(resourceName, resourceName, "gpu.example.com")
+		if !cache.Has(resourceName) {
+			t.Error("expected the resource to remain registered after an unchanged update")
+		}
+	})
+
+	t.Run("update moves a DeviceClass to its new resource name", func(t *testing.T) {
+		cache.Update("example.com/gpu", "example.com/tpu", "gpu.example.com")
+		if cache.Has("example.com/gpu") {
+			t.Error("expected the old resource name to be removed")
+		}
+		if !cache.Has("example.com/tpu") {
+			t.Error("expected the new resource name to be registered")
+		}
+	})
+
 	t.Run("remove non-existent DeviceClass is no-op", func(t *testing.T) {
 		cache.Remove("nonexistent.com/resource", "nonexistent.example.com")
 		if cache.Has("nonexistent.com/resource") {

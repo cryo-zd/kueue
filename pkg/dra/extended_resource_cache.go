@@ -61,6 +61,28 @@ func (c *ExtendedResourceCache) Add(resourceName corev1.ResourceName, deviceClas
 func (c *ExtendedResourceCache) Remove(resourceName corev1.ResourceName, deviceClassName string) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
+	c.remove(resourceName, deviceClassName)
+}
+
+// Update atomically moves a DeviceClass from oldResourceName to newResourceName.
+// When the resource name does not change, it keeps the existing registration visible
+// to concurrent readers.
+func (c *ExtendedResourceCache) Update(oldResourceName, newResourceName corev1.ResourceName, deviceClassName string) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	if oldResourceName != newResourceName {
+		c.remove(oldResourceName, deviceClassName)
+	}
+	if newResourceName != "" {
+		if c.resources[newResourceName] == nil {
+			c.resources[newResourceName] = sets.New[string]()
+		}
+		c.resources[newResourceName].Insert(deviceClassName)
+	}
+}
+
+func (c *ExtendedResourceCache) remove(resourceName corev1.ResourceName, deviceClassName string) {
 	if s, ok := c.resources[resourceName]; ok {
 		s.Delete(deviceClassName)
 		if s.Len() == 0 {

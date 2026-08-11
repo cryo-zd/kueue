@@ -21,7 +21,10 @@ import (
 	stderrors "errors"
 	"fmt"
 	"maps"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,6 +39,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/component-base/featuregate"
 	testingclock "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -2280,6 +2284,83 @@ func setupDRACache(objs []client.Object) *dra.ExtendedResourceCache {
 		}
 	}
 	return draCache
+}
+
+func TestDeviceClassUpdateDoesNotExposeUnregisteredResource(t *testing.T) {
+	const (
+		resourceName    = "example.com/gpu"
+		deviceClassName = "gpu.example.com"
+		updates         = 10000
+		readers         = 64
+	)
+
+	previousProcs := runtime.GOMAXPROCS(readers)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previousProcs) })
+
+	features.SetFeatureGateDuringTest(t, features.KueueDRAIntegration, true)
+	features.SetFeatureGateDuringTest(t, features.KueueDRAIntegrationExtendedResource, true)
+
+	draCache := dra.NewExtendedResourceCache()
+	draCache.Add(resourceName, deviceClassName)
+	workload := &kueue.Workload{
+		Spec: kueue.WorkloadSpec{
+			PodSets: []kueue.PodSet{{
+				Name: "main",
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name: "main",
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{resourceName: resource.MustParse("1")},
+							},
+						}},
+					},
+				},
+			}},
+		},
+	}
+	reconciler := &WorkloadReconciler{
+		client:             utiltesting.NewClientBuilder().Build(),
+		draBackedResources: draCache,
+	}
+	handler := &deviceClassHandler{r: reconciler}
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+	t.Cleanup(queue.ShutDown)
+	oldDeviceClass := utiltesting.MakeDeviceClass(deviceClassName).ExtendedResourceName(resourceName).Obj()
+	newDeviceClass := oldDeviceClass.DeepCopy()
+
+	start := make(chan struct{})
+	stop := make(chan struct{})
+	var sawUnregistered atomic.Bool
+	var readerWG sync.WaitGroup
+	for range readers {
+		readerWG.Add(1)
+		go func() {
+			defer readerWG.Done()
+			<-start
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					if !dra.NeedsDRAReconcile(workload, draCache) {
+						sawUnregistered.Store(true)
+					}
+				}
+			}
+		}()
+	}
+
+	close(start)
+	for range updates {
+		handler.Update(t.Context(), event.UpdateEvent{ObjectOld: oldDeviceClass, ObjectNew: newDeviceClass}, queue)
+	}
+	close(stop)
+	readerWG.Wait()
+
+	if sawUnregistered.Load() {
+		t.Fatal("DeviceClass update caused a DRA-backed workload to skip DRA reconciliation")
+	}
 }
 
 func TestUpdateAfsConsumedUsage(t *testing.T) {
