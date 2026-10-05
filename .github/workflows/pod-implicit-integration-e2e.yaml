@@ -1,0 +1,87 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Pod implicit integration regression (e2e)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      E2E_K8S_FULL_VERSION: "1.36.4"
+      KIND_CLUSTER_NAME: pod-implicit-regression
+      # Reuse a prebuilt node image and keep the cluster until logs are uploaded.
+      E2E_MODE: dev
+      E2E_NPROCS: "1"
+      ARTIFACTS: ${{ github.workspace }}/artifacts
+      GINKGO_ARGS: >-
+        --label-filter=feature:podintegrationautoenablement
+        --focus='should not manage plain pods.*with a default LocalQueue'
+        --fail-on-empty
+        --timeout=15m
+        --junit-report=junit.xml
+
+    steps:
+      - name: Check out the selected branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go from go.mod
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            hack/tools/go.sum
+
+      - name: Build Kueue from the selected commit
+        run: |
+          mkdir -p "$ARTIFACTS"
+          make kind-image-build IMAGE_TAG="kueue-e2e/manager:${GITHUB_SHA}" 2>&1 | tee "$ARTIFACTS/build.log"
+
+      - name: Cache the prebuilt Kubernetes node image
+        run: |
+          docker pull "kindest/node:v${E2E_K8S_FULL_VERSION}"
+          # build_kind_node_image skips rebuilding this image in dev mode.
+          docker tag "kindest/node:v${E2E_K8S_FULL_VERSION}" "kueue/kind-node:v${E2E_K8S_FULL_VERSION}"
+
+      - name: Run the default LocalQueue regression
+        run: |
+          make test-e2e-sequential-baseline IMAGE_TAG="kueue-e2e/manager:${GITHUB_SHA}" 2>&1 | tee "$ARTIFACTS/test.log"
+
+      - name: Upload reports and cluster logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pod-implicit-integration-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Delete the runner's test cluster
+        if: always()
+        run: |
+          if [[ -x bin/kind ]]; then
+            bin/kind delete cluster --name "$KIND_CLUSTER_NAME"
+          fi
