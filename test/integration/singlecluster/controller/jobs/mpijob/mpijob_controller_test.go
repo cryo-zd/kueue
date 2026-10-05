@@ -17,6 +17,7 @@ limitations under the License.
 package mpijob
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,6 +35,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
@@ -76,6 +79,52 @@ var _ = ginkgo.Describe("Job controller", func() {
 	})
 	ginkgo.AfterEach(func() {
 		gomega.Expect(util.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
+	})
+
+	ginkgo.It("Should preserve an MPIJob recreated after MultiKueue ownership validation", func() {
+		const origin = "test-origin"
+		baseJob := testingmpijob.MakeMPIJob(jobName, ns.Name).GenericLauncherAndWorker()
+		ownedJob := baseJob.Clone().Label(kueue.MultiKueueOriginLabel, origin).Obj()
+		util.MustCreate(ctx, k8sClient, ownedJob)
+
+		integrationManager := jobframework.NewIntegrationManager()
+		gomega.Expect(workloadmpijob.RegisterIntegration(integrationManager)).To(gomega.Succeed())
+		integration, found := integrationManager.GetIntegration(workloadmpijob.FrameworkName)
+		gomega.Expect(found).To(gomega.BeTrue())
+
+		workerClient, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		replacement := baseJob.Clone().Obj()
+		replacementCreated := false
+		remoteClient := interceptor.NewClient(workerClient, interceptor.Funcs{
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if replacementCreated {
+					return c.Delete(ctx, obj, opts...)
+				}
+				// Replace the job after the ownership check, before its DELETE reaches the API server.
+				ginkgo.By("deleting the owned MPIJob and recreating its name without a MultiKueue origin")
+				gomega.Expect(c.Delete(ctx, ownedJob)).To(gomega.Succeed())
+				gomega.Eventually(func() error {
+					return c.Get(ctx, client.ObjectKeyFromObject(ownedJob), &kfmpi.MPIJob{})
+				}, util.Timeout, util.Interval).Should(gomega.MatchError(apierrors.IsNotFound, "NotFound"))
+				gomega.Expect(c.Create(ctx, replacement)).To(gomega.Succeed())
+				gomega.Expect(replacement.UID).NotTo(gomega.Equal(ownedJob.UID))
+				replacementCreated = true
+				return c.Delete(ctx, obj, opts...)
+			},
+		})
+
+		ginkgo.By("running the MultiKueue ownership check and MPIJob deletion adapter")
+		err = jobframework.DeleteRemoteObjectIfOwned(ctx, k8sClient, remoteClient,
+			integration.MultiKueueAdapter, client.ObjectKeyFromObject(ownedJob), origin)
+		gomega.Expect(err).To(gomega.MatchError(apierrors.IsConflict, "Conflict"))
+		gomega.Expect(replacementCreated).To(gomega.BeTrue())
+
+		ginkgo.By("verifying the replacement MPIJob survives with its new UID")
+		got := &kfmpi.MPIJob{}
+		gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(replacement), got)).To(gomega.Succeed())
+		gomega.Expect(got.UID).To(gomega.Equal(replacement.UID))
+		gomega.Expect(got.Labels).NotTo(gomega.HaveKey(kueue.MultiKueueOriginLabel))
 	})
 
 	ginkgo.It("Should reconcile MPIJobs", func() {

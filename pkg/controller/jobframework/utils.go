@@ -292,32 +292,38 @@ var ErrMultiKueueOriginEmpty = errors.New("multikueue origin is empty")
 // Returns (false, nil) if the object does not exist.
 // Returns (false, err) if there is a retrieval error or if the object is not owned by this MultiKueue origin.
 func ValidateRemoteObjectOwnership(ctx context.Context, remoteClient client.Client, key types.NamespacedName, gvk schema.GroupVersionKind, origin string) (bool, error) {
+	remoteObject, err := getRemoteObjectIfOwned(ctx, remoteClient, key, gvk, origin)
+	return remoteObject != nil, err
+}
+
+func getRemoteObjectIfOwned(ctx context.Context, remoteClient client.Client, key types.NamespacedName, gvk schema.GroupVersionKind, origin string) (*metav1.PartialObjectMetadata, error) {
 	log := ctrl.LoggerFrom(ctx).WithValues("remoteObject", key, "objectType", gvk, "origin", origin)
 
 	if origin == "" {
 		log.Error(ErrMultiKueueOriginEmpty, "Remote object ownership validation failed because origin is empty")
-		return false, ErrMultiKueueOriginEmpty
+		return nil, ErrMultiKueueOriginEmpty
 	}
 
 	remoteObject := &metav1.PartialObjectMetadata{}
 	remoteObject.SetGroupVersionKind(gvk)
 	if err := remoteClient.Get(ctx, key, remoteObject); err != nil {
 		if client.IgnoreNotFound(err) == nil {
-			return false, nil
+			return nil, nil
 		}
-		return false, err
+		return nil, err
 	}
 
 	if objOrigin, owned := remoteObject.GetLabels()[kueue.MultiKueueOriginLabel]; !owned || objOrigin != origin {
-		return false, fmt.Errorf("%w: expected %q=%q on %T %q", ErrRemoteObjectNotOwnedByMultiKueue, kueue.MultiKueueOriginLabel, origin, remoteObject, client.ObjectKeyFromObject(remoteObject))
+		return nil, fmt.Errorf("%w: expected %q=%q on %T %q", ErrRemoteObjectNotOwnedByMultiKueue, kueue.MultiKueueOriginLabel, origin, remoteObject, client.ObjectKeyFromObject(remoteObject))
 	}
 
-	return true, nil
+	return remoteObject, nil
 }
 
 // DeleteRemoteObjectIfOwned fetches the remote object for the given adapter's GVK and key,
 // skips deletion if the object does not exist or is not owned by this MultiKueue origin,
-// and otherwise delegates to adapter.DeleteRemoteObject.
+// and otherwise delegates to adapter.DeleteRemoteObject with a UID precondition
+// for the validated object, so a replacement at the same key cannot be deleted.
 // Returns ErrMultiKueueOriginEmpty if origin is empty.
 func DeleteRemoteObjectIfOwned(ctx context.Context, localClient client.Client, remoteClient client.Client, adapter MultiKueueAdapter, key types.NamespacedName, origin string) error {
 	log := ctrl.LoggerFrom(ctx).WithValues("remoteObject", key, "adapterGVK", adapter.GVK().String(), "origin", origin)
@@ -327,7 +333,7 @@ func DeleteRemoteObjectIfOwned(ctx context.Context, localClient client.Client, r
 		return ErrMultiKueueOriginEmpty
 	}
 
-	found, err := ValidateRemoteObjectOwnership(ctx, remoteClient, key, adapter.GVK(), origin)
+	remoteObject, err := getRemoteObjectIfOwned(ctx, remoteClient, key, adapter.GVK(), origin)
 	if err != nil {
 		if errors.Is(err, ErrRemoteObjectNotOwnedByMultiKueue) {
 			log.V(2).Info("Skipping remote object deletion because object is not owned by this MultiKueue origin")
@@ -335,10 +341,37 @@ func DeleteRemoteObjectIfOwned(ctx context.Context, localClient client.Client, r
 		}
 		return err
 	}
-	if !found {
+	if remoteObject == nil {
 		log.V(2).Info("Skipping remote object deletion because object was not found")
 		return nil
 	}
 
-	return adapter.DeleteRemoteObject(ctx, localClient, remoteClient, key)
+	return adapter.DeleteRemoteObject(ctx, localClient, &uidPreconditionClient{Client: remoteClient, object: remoteObject}, key)
+}
+
+// uidPreconditionClient binds deletion to the object whose ownership was checked
+// while preserving adapter-specific cleanup and deletion options.
+type uidPreconditionClient struct {
+	client.Client
+	object *metav1.PartialObjectMetadata
+}
+
+func (c *uidPreconditionClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if client.ObjectKeyFromObject(obj) == client.ObjectKeyFromObject(c.object) {
+		gvk, err := c.GroupVersionKindFor(obj)
+		if err != nil {
+			return err
+		}
+		// An adapter may also delete other objects, such as members of a Pod group.
+		if gvk.GroupKind() == c.object.GroupVersionKind().GroupKind() {
+			deleteOptions := (&client.DeleteOptions{}).ApplyOptions(opts)
+			preconditions := metav1.Preconditions{UID: &c.object.UID}
+			if deleteOptions.Preconditions != nil {
+				preconditions.ResourceVersion = deleteOptions.Preconditions.ResourceVersion
+			}
+			deleteOptions.Preconditions = &preconditions
+			return c.Client.Delete(ctx, obj, deleteOptions)
+		}
+	}
+	return c.Client.Delete(ctx, obj, opts...)
 }
