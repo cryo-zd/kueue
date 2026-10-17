@@ -1,0 +1,32 @@
+name: RayJob selector integration test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rayjob-selector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Run RayJob selector regression test
+        env:
+          CGO_ENABLED: "1"
+          INTEGRATION_TARGET: ./test/integration/singlecluster/webhook/jobs
+          INTEGRATION_NPROCS: "1"
+          INTEGRATION_FILTERS: >-
+            --focus="RayJob Webhook With manageJobsWithoutQueueName enabled should leave a RayJob using an existing cluster unsuspended and without a Workload"
+            --fail-on-empty
+        run: make test-integration
