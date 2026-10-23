@@ -1,0 +1,49 @@
+name: RayJob selector submitter E2E
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rayjob-selector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      ARTIFACTS: ${{ github.workspace }}/artifacts
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Prepare E2E tools and build Kueue from this checkout
+        run: |
+          mkdir -p "$ARTIFACTS"
+          make setup-e2e-env kind-image-build 2>&1 | tee "$ARTIFACTS/setup.log"
+
+      - name: Run RayJob selector submitter test
+        run: |
+          make test-e2e-extended \
+            E2E_NPROCS=1 \
+            USE_RAY_FOR_TESTS=ray \
+            GINKGO_ARGS='--label-filter=feature:kuberay --focus=Should.admit.the.submitter.Job.for.a.RayJob.using.an.existing.cluster --fail-on-empty' \
+            2>&1 | tee "$ARTIFACTS/test.log"
+
+      - name: Upload test output and cluster diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rayjob-selector-e2e
+          path: artifacts/
+          retention-days: 7
